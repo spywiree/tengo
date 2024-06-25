@@ -2,6 +2,7 @@ package tengo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -95,6 +96,9 @@ func (s *Script) Compile() (*Compiled, error) {
 		return nil, err
 	}
 
+	out := symbolTable.Define("$out")
+	globals[out.Index] = UndefinedValue
+
 	fileSet := parser.NewFileSet()
 	srcFile := fileSet.AddFile("(main)", -1, len(s.input))
 	p := parser.NewParser(srcFile, s.input, nil)
@@ -138,6 +142,7 @@ func (s *Script) Compile() (*Compiled, error) {
 		bytecode:      bytecode,
 		globals:       globals,
 		maxAllocs:     s.maxAllocs,
+		outIdx:        out.Index,
 	}, nil
 }
 
@@ -200,6 +205,7 @@ type Compiled struct {
 	globals       []Object
 	maxAllocs     int64
 	lock          sync.RWMutex
+	outIdx        int
 }
 
 // Run executes the compiled script in the virtual machine.
@@ -335,4 +341,74 @@ func (c *Compiled) Set(name string, value interface{}) error {
 	}
 	c.globals[idx] = obj
 	return nil
+}
+
+// *************************************
+// Based on: https://gist.github.com/tgascoigne/f8d6c6538a5841bcb5f135668279b93b and https://github.com/d5/tengo/issues/275
+
+func (c *Compiled) Call(
+	fn string,
+	args ...interface{}) (interface{}, error) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	// compiled function
+
+	idx, ok := c.globalIndexes[fn]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	cfn, ok := c.globals[idx].(*CompiledFunction)
+	if !ok {
+		return nil, errors.New("not a compiled function")
+	}
+	targs := make([]Object, 0, len(args))
+	for i := range args {
+		v, err := FromInterface(args[i])
+		if err != nil {
+			return nil, err
+		}
+		targs = append(targs, v)
+	}
+	v, err := c.callCompiled(cfn, targs...)
+	if err != nil {
+		return nil, err
+	}
+	return ToInterface(v), nil
+}
+
+func (c *Compiled) callCompiled(
+	fn *CompiledFunction,
+	args ...Object) (Object, error) {
+
+	constsOffset := len(c.bytecode.Constants)
+
+	// Load fn
+	inst := MakeInstruction(parser.OpConstant, constsOffset)
+
+	// Load args
+	for i := range args {
+		inst = append(inst,
+			MakeInstruction(parser.OpConstant, constsOffset+i+1)...)
+	}
+
+	// Call, set value to a global, stop
+	inst = append(inst, MakeInstruction(parser.OpCall, len(args))...)
+	inst = append(inst, MakeInstruction(parser.OpSetGlobal, c.outIdx)...)
+	inst = append(inst, MakeInstruction(parser.OpSuspend)...)
+
+	c.bytecode.Constants = append(c.bytecode.Constants, fn)
+	c.bytecode.Constants = append(c.bytecode.Constants, args...)
+
+	orig := c.bytecode.MainFunction
+	c.bytecode.MainFunction = &CompiledFunction{
+		Instructions: inst,
+	}
+
+	vm := NewVM(c.bytecode, c.globals, -1)
+	err := vm.Run()
+	// go back to normal if required
+	c.bytecode.MainFunction = orig
+	c.bytecode.Constants = c.bytecode.Constants[:constsOffset]
+	// get symbol using index and return it
+	return c.globals[c.outIdx], err
 }
